@@ -64,6 +64,7 @@ INPUT_COL_PROTRUSION = 'column_protrusion'
 INPUT_CREATE_LID = 'create_lid'
 INPUT_CREATE_RECEIVER = 'create_receiver'
 
+INPUT_PREVIEW = 'show_preview'
 INPUT_ERROR_TEXT = 'error_text'
 
 local_handlers = []
@@ -236,6 +237,17 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     gwh.addBoolValueInput(INPUT_CREATE_LID, 'Create Lid', True, '', True)
     gwh.addBoolValueInput(INPUT_CREATE_RECEIVER, 'Create Receiver', True, '', True)
 
+    # Preview toggle — off by default because the build takes ~2 seconds and
+    # recomputes on every input change when enabled.
+    preview_tooltip = (
+        'Show a live preview as you edit. Rebuilds on every parameter change '
+        '(roughly 1–2 seconds per update). Off by default to keep the dialog '
+        'responsive; turn on when you want to see the result before committing.'
+    )
+    preview_input = gwh.addBoolValueInput(INPUT_PREVIEW, 'Show preview', True, '', False)
+    preview_input.tooltip = 'Show preview'
+    preview_input.tooltipDescription = preview_tooltip
+
     # Error display, updated by command_validate_input
     error_box = inputs.addTextBoxCommandInput(
         INPUT_ERROR_TEXT, '', '', 2, True
@@ -245,6 +257,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # Wire event handlers
     futil.add_handler(
         args.command.execute, command_execute, local_handlers=local_handlers
+    )
+    futil.add_handler(
+        args.command.executePreview, command_preview, local_handlers=local_handlers
     )
     futil.add_handler(
         args.command.validateInputs, command_validate_input, local_handlers=local_handlers
@@ -332,9 +347,83 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 # Execute the build
 # =========================================================================
 
+# =========================================================================
+# Preview (live rebuild on input change, opt-in via checkbox)
+# =========================================================================
+
+def command_preview(args: adsk.core.CommandEventArgs):
+    """
+    Fires when an input changes. Rebuilds the SnapLock geometry if the
+    "Show preview" checkbox is on.
+
+    Fusion 360 automatically wraps preview execution in an implicit
+    transaction — any features created here are rolled back when:
+      - the next executePreview fires (user changed another input),
+      - the dialog is cancelled, or
+      - execute() runs (user clicked OK) UNLESS we set isValidResult = True.
+
+    Setting args.isValidResult = True tells Fusion "this preview IS the
+    final result, don't re-run execute()", which saves a second ~2s build
+    on OK.
+
+    If the params are invalid or the build fails, we silently return. The
+    error is surfaced by validateInputs (green check / red list) instead.
+    """
+    inputs = args.command.commandInputs
+
+    # Is preview enabled?
+    try:
+        preview_on = bool(inputs.itemById(INPUT_PREVIEW).value)
+    except Exception:
+        preview_on = False
+    if not preview_on:
+        return
+
+    # Gracefully bail if params don't parse (e.g., user mid-typing)
+    try:
+        params, snaplock = _params_from_inputs(inputs)
+    except Exception as e:
+        futil.log(f'{CMD_NAME} preview: params parse failed: {e}')
+        return
+
+    errors = params.validate()
+    if errors:
+        futil.log(f'{CMD_NAME} preview: {len(errors)} validation errors, skipping build')
+        return
+
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if not design:
+        return
+
+    try:
+        snaplock.build_snaplock(params, design)
+        # Tell Fusion this preview IS the final result — no need to re-run
+        # execute() when the user clicks OK.
+        args.isValidResult = True
+    except Exception as e:
+        # Preview failures during typing are expected; log but don't crash
+        # the dialog. The user will see the validateInputs feedback.
+        futil.log(f'{CMD_NAME} preview build failed (non-fatal): {e}')
+
+
+# =========================================================================
+# Execute the build
+# =========================================================================
+
 def command_execute(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Execute Event')
     inputs = args.command.commandInputs
+
+    # If preview was on and successfully built the geometry, Fusion has
+    # already set the preview as the final result (via args.isValidResult
+    # in command_preview). In that case, executePreview handled everything
+    # and we should not rebuild.
+    #
+    # We can detect this by checking the preview checkbox: if it's on and
+    # we reach here, either the preview was cleared (user toggled it off
+    # mid-edit) or Fusion is asking us to finalize anyway. In practice, if
+    # preview.isValidResult was set, execute() is not called. So if we're
+    # here, we need to build from scratch.
 
     try:
         params, snaplock = _params_from_inputs(inputs)
