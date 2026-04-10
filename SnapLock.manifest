@@ -3,9 +3,9 @@
 	"type":	"addin",
 	"author":	"jesper vang",
 	"description":	{
-		"":	"Easy snap locks for inner and outer. "
+		"":	"Parametric twist-snap bayonet lock — generate Lid + Receiver from scratch, or add a locking interface to your own container."
 	},
-	"version":	"0.9.0",
+	"version":	"0.10.0",
 	"runOnStartup":	false,
 	"supportedOS":	"windows|mac",
 	"editEnabled":	true,

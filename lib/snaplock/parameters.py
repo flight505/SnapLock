@@ -265,3 +265,220 @@ class SnaplockParams:
             else:
                 result[f] = v
         return result
+
+
+# ============================================================
+# Interface-only mode — add SnapLock features to a user's
+# existing container body instead of generating a full receiver.
+# ============================================================
+
+@dataclass
+class SnaplockInterfaceParams:
+    """
+    Parametric dimensions for adding SnapLock locking features to an EXISTING
+    container body. Used by the "SnapLock Interface" command and the
+    interface_builder module.
+
+    Mental model: the user has built their own vessel (any shape, any
+    decorative exterior) and selected its inner cavity's cylindrical wall.
+    The interface builder reads the cavity radius + top Z from the selection
+    and adds slot cuts + snap columns to that existing wall. A matching Lid
+    is generated as a separate component.
+
+    Internal units: CENTIMETERS.
+
+    Primary dimension: `cavity_inner_radius` (read from the selected face).
+    All lid / tab / column geometry is derived from this, with user-controlled
+    clearances and wall-feature thicknesses.
+    """
+
+    # --- Target geometry (set from the selected face at execute time) ---
+    cavity_inner_radius: float       # cm, from selected cylindrical face radius
+    slot_ceiling_z: float            # cm, world Z of the slot ceiling (face top)
+
+    # --- Wall feature extents (user-settable in dialog) ---
+    body_height: float = 1.0         # cm — how far down the slot wall extends (10 mm)
+    rim_height: float = 0.5          # cm — lid rim drop below body top (5 mm)
+    rim_thickness: float = 0.2       # cm — slot wall thickness (2 mm)
+    lid_clearance: float = 0.015     # cm — slip-fit gap between cavity and lid rim (0.15 mm)
+    ceiling_cap_thickness: float = 0.2  # cm — lid cap thickness (2 mm)
+
+    # --- Assumed receiver wall thickness (the user's container's wall) ---
+    # Used for computing the equivalent SnaplockParams for lid generation.
+    # Not applied to the user's actual container — their wall is whatever
+    # they built. This just controls the generated Lid's outer wall.
+    receiver_wall_thickness: float = 0.2  # cm (2 mm default)
+
+    # --- Lock mechanism (identical meaning to SnaplockParams) ---
+    tab_width: float = 0.3           # 3 mm radial tab extent
+    tab_drop_height: float = 0.1     # 1 mm tab flat
+    tab_chamfer_drop: float = 0.3    # 3 mm 45° chamfer drop
+    tab_revolve_angle: float = 20.0  # degrees
+    slot_entry_angle: float = 25.0   # degrees
+    num_tabs: int = 4
+    column_protrusion: float = 0.04  # 0.4 mm snap column protrusion
+
+    # --- Output options ---
+    create_matching_lid: bool = True
+    lid_name: str = "SnapLock Lid"
+
+    def validate(self) -> List[str]:
+        """Return a list of validation errors. Empty list means valid."""
+        errors = []
+
+        if self.cavity_inner_radius <= 0:
+            errors.append("cavity_inner_radius must be > 0 (read from face selection)")
+
+        if self.body_height <= 0:
+            errors.append("body_height must be > 0")
+        if self.rim_height <= 0:
+            errors.append("rim_height must be > 0")
+        if self.rim_thickness <= 0:
+            errors.append("rim_thickness must be > 0")
+        if self.lid_clearance < 0:
+            errors.append("lid_clearance must be >= 0")
+        if self.ceiling_cap_thickness < 0:
+            errors.append("ceiling_cap_thickness must be >= 0 (use 0 for no cap)")
+
+        # Cavity must accommodate lid rim (with clearance) + tab width inside it.
+        #   rim_outer_radius = cavity_inner_radius - lid_clearance
+        #   rim_inner_radius = rim_outer_radius - rim_thickness
+        #   Must be > 0 and leave room for tabs to extend outward to cavity wall.
+        rim_outer = self.cavity_inner_radius - self.lid_clearance
+        rim_inner = rim_outer - self.rim_thickness
+        if rim_inner <= 0:
+            errors.append(
+                f"Cavity too small: rim_inner would be {rim_inner*10:.2f} mm. "
+                f"Need cavity_inner_radius > lid_clearance + rim_thickness "
+                f"(currently {(self.lid_clearance + self.rim_thickness)*10:.1f} mm)."
+            )
+
+        # Tab must reach past the rim outer face to engage the user's wall.
+        # tab_tip_radius = rim_inner + tab_width > rim_outer = cavity_inner_radius - lid_clearance
+        tab_tip = rim_inner + self.tab_width
+        if tab_tip <= rim_outer:
+            errors.append(
+                f"Tab width {self.tab_width*10:.1f} mm too small — tab tip at "
+                f"R={tab_tip*10:.2f} mm doesn't reach cavity wall at "
+                f"R={rim_outer*10:.2f} mm. Increase tab_width or reduce rim_thickness."
+            )
+
+        # Tab count sanity (same as SnaplockParams)
+        if self.num_tabs < 2:
+            errors.append("num_tabs must be >= 2")
+        if self.num_tabs > 12:
+            errors.append("num_tabs > 12 is impractical (arcs would overlap)")
+
+        # Slot/entry angle invariants (same as SnaplockParams)
+        if self.slot_entry_angle <= self.tab_revolve_angle:
+            errors.append(
+                f"slot_entry_angle ({self.slot_entry_angle}°) must be > "
+                f"tab_revolve_angle ({self.tab_revolve_angle}°) for insertion clearance"
+            )
+        total_arc_per_tab = self.tab_revolve_angle + self.slot_entry_angle
+        arc_per_sector = 360 / self.num_tabs
+        if total_arc_per_tab >= arc_per_sector:
+            errors.append(
+                f"total arc per tab ({total_arc_per_tab}°) must be < "
+                f"360°/num_tabs ({arc_per_sector:.1f}°) for separation between pairs"
+            )
+
+        # Tab printability
+        if self.tab_drop_height < 0.05:
+            errors.append(
+                f"tab_drop_height ({self.tab_drop_height*10:.1f} mm) must be >= 0.5 mm "
+                "for FDM printability"
+            )
+
+        # Column protrusion invariants
+        if self.column_protrusion <= 0:
+            errors.append("column_protrusion must be > 0")
+        if self.column_protrusion >= self.tab_drop_height:
+            errors.append(
+                f"column_protrusion ({self.column_protrusion*10:.2f} mm) must be < "
+                f"tab_drop_height ({self.tab_drop_height*10:.2f} mm) "
+                "for snap-and-release (otherwise permanent lock)"
+            )
+
+        return errors
+
+    def validate_or_raise(self):
+        errors = self.validate()
+        if errors:
+            raise ValueError("SnaplockInterfaceParams validation failed:\n  - " + "\n  - ".join(errors))
+
+    def to_equivalent_snaplock_params(self) -> "SnaplockParams":
+        """
+        Build a SnaplockParams that mirrors this interface configuration,
+        for reuse with the existing build_lid() logic.
+
+        The derivation:
+          rim_outer_radius  = cavity_inner_radius - lid_clearance    (lid slips into cavity)
+          outer_radius      = cavity_inner_radius + receiver_wall_thickness
+          outer_wall_thickness + channel_width = outer_radius - rim_outer_radius
+            (we allocate channel_width = outer_radius - rim_outer_radius - outer_wall_thickness
+             with outer_wall_thickness chosen = receiver_wall_thickness so the generated
+             lid's outer wall matches the container's wall thickness, and channel_width
+             = receiver_wall_thickness + lid_clearance.)
+        """
+        # Lid rim must fit inside the cavity with clearance
+        target_rim_outer_radius = self.cavity_inner_radius - self.lid_clearance
+
+        # Lid outer wall matches the user's assumed receiver wall thickness
+        outer_wall_thickness = self.receiver_wall_thickness
+
+        # Lid outer radius = rim_outer + channel + outer_wall_thickness, and
+        # we want the lid to fit snugly over the container's outer wall
+        # (outer wall at cavity_r + receiver_wall_thickness). So:
+        #   lid_outer_radius = cavity_inner_radius + receiver_wall_thickness
+        lid_outer_radius = self.cavity_inner_radius + self.receiver_wall_thickness
+        lid_outer_diameter = lid_outer_radius * 2
+
+        # Back-compute channel_width so rim_outer_radius ends up correct:
+        #   rim_outer_radius = (lid_outer_radius - outer_wall_thickness) - channel_width
+        # ⇒ channel_width = lid_outer_radius - outer_wall_thickness - target_rim_outer_radius
+        channel_width = (
+            lid_outer_radius - outer_wall_thickness - target_rim_outer_radius
+        )
+
+        return SnaplockParams(
+            outer_diameter=lid_outer_diameter,
+            outer_wall_thickness=outer_wall_thickness,
+            channel_width=channel_width,
+            rim_thickness=self.rim_thickness,
+            rim_height=self.rim_height,
+            body_height=self.body_height,
+            floor_thickness=0.2,  # unused in interface mode
+            cap_thickness=self.ceiling_cap_thickness,
+            tab_width=self.tab_width,
+            tab_drop_height=self.tab_drop_height,
+            tab_chamfer_drop=self.tab_chamfer_drop,
+            tab_revolve_angle=self.tab_revolve_angle,
+            slot_entry_angle=self.slot_entry_angle,
+            num_tabs=self.num_tabs,
+            column_protrusion=self.column_protrusion,
+            create_lid=self.create_matching_lid,
+            create_receiver=False,  # interface mode never builds a new receiver
+            lid_name=self.lid_name,
+            receiver_name="unused",
+            lid_build_z_offset=10.0,  # default 100mm during build
+        )
+
+    def to_mm_dict(self) -> dict:
+        """Export as a dict with dimensional values in mm (for logging/MCP responses)."""
+        dimensional = {
+            "cavity_inner_radius", "slot_ceiling_z",
+            "body_height", "rim_height", "rim_thickness",
+            "lid_clearance", "ceiling_cap_thickness",
+            "receiver_wall_thickness",
+            "tab_width", "tab_drop_height", "tab_chamfer_drop",
+            "column_protrusion",
+        }
+        result = {}
+        for f in self.__dataclass_fields__:
+            v = getattr(self, f)
+            if f in dimensional and isinstance(v, (int, float)):
+                result[f] = v * 10.0
+            else:
+                result[f] = v
+        return result

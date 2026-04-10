@@ -15,18 +15,21 @@ Usage:
     # result['receiver'] = {...}
     # result['warnings'] = [...]
 """
-from .parameters import SnaplockParams
+from .parameters import SnaplockParams, SnaplockInterfaceParams
 from .lid_builder import build_lid
 from .receiver_builder import build_receiver
+from .interface_builder import build_snaplock_interface
 from .geometry_utils import create_component_at, move_occurrence_z
 
 import adsk.fusion  # type: ignore
 
 __all__ = [
     "SnaplockParams",
+    "SnaplockInterfaceParams",
     "build_lid",
     "build_receiver",
     "build_snaplock",
+    "build_snaplock_interface",
 ]
 
 
