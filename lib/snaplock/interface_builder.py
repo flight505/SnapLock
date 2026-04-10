@@ -2,30 +2,27 @@
 Interface-only SnapLock builder — adds locking features to an EXISTING
 user container body instead of generating a complete receiver.
 
-This is the "SnapLock Interface" command's backend. It mirrors the
-receiver_builder's slot-cut + snap-column logic but applies it to a
-target body that the user already built. A matching Lid is still
-generated as a separate component (reusing build_lid unchanged).
+v0.10.0 (previous): used world-XZ sketches, required container axis
+parallel to world +Z.
 
-Geometry constraints for v1:
-  - The user's container must have its cylindrical axis parallel to
-    world +Z (the slot cuts and columns are built relative to the
-    component's XZ plane and Z axis).
-  - The selected face must be a cylindrical inner wall of the container
-    cavity. Its radius becomes `cavity_inner_radius` in the math; its
-    top edge Z becomes `slot_ceiling_z`.
+v0.11.0 (this file): uses a frame-aware approach. The CylinderFrame
+abstraction (frame.py) lets us sketch on an on-the-fly radial plane
+containing the cylinder's actual axis, so the interface can be applied
+to a container at any orientation.
 
 Build sequence:
-  1. Validate iparams + read face geometry
-  2. Shift coordinate math so Z=0 corresponds to the face top
-  3. Cut slot + entry cavities into the user's body at the engagement zone
-  4. Verify wall consistency (pointContainment probe at slot midpoints)
-  5. Add snap columns joined into the wall material
-  6. Verify column presence
-  7. Fillet column tips (non-fatal)
-  8. If create_matching_lid: build a standalone Lid component via build_lid
-
-All dimensions in CENTIMETERS internally.
+  1. Read the selected face into a CylinderFrame
+  2. Validate iparams (with cavity_inner_radius populated from the frame)
+  3. Create an on-demand radial construction plane through the cylinder axis
+  4. Sketch slot + entry tool profiles in frame-local (R, Z_along) coords
+  5. Revolve around a frame-local construction axis → tool bodies
+  6. Body-pattern tool bodies around the frame axis
+  7. Combine-cut all tools from the user's target body
+  8. Verify wall consistency via pointContainment probes in frame coords
+  9. Build snap columns on a frame-perpendicular cross-section plane,
+     extrude along the axis, pattern, combine-join
+  10. Verify columns present; fillet tips (non-fatal)
+  11. Optionally generate a matching Lid and orient it to the frame
 """
 import math
 from typing import Optional
@@ -35,15 +32,18 @@ import adsk.fusion  # type: ignore
 
 from .parameters import SnaplockParams, SnaplockInterfaceParams
 from .lid_builder import build_lid
+from .frame import (
+    CylinderFrame,
+    frame_from_cylinder_face,
+    create_radial_plane,
+    create_cross_section_plane,
+    create_frame_axis,
+    sketch_radial_profile_in_frame,
+    cylindrical_to_world,
+)
 from .geometry_utils import (
-    sketch_xz_closed_profile,
-    revolve_profile,
-    pattern_bodies_around_z,
     combine_bodies,
-    verify_wall_consistency,
-    verify_point_in_body,
     create_component_at,
-    move_occurrence_z,
 )
 
 
@@ -59,37 +59,31 @@ def build_snaplock_interface(
     """
     Add SnapLock locking features to the body that owns `target_face`.
 
-    Args:
-        iparams: interface parameters (cavity_inner_radius and slot_ceiling_z
-            may be set either before the call, or will be read from the face
-            here if they're zero/unset).
-        design: active Fusion design
-        target_face: a cylindrical BRepFace that the user selected. This
-            must belong to the receiver-side body. Its radius defines the
-            cavity_inner_radius; the top edge of the face defines the
-            slot_ceiling_z.
+    v0.11.0: works for arbitrary cylinder orientations. The face's axis
+    direction is used to construct local sketch planes and the revolve
+    axis; nothing assumes world-Z alignment anymore.
 
-    Returns:
-        {
-            'receiver': { body, component, volume_mm3, column_check, ... },
-            'lid': { ... } or None,
-            'warnings': [...],
-            'params_mm': {...},
-        }
+    Args:
+        iparams: interface parameters (cavity_inner_radius and
+            slot_ceiling_z may be zero — they're populated from the
+            face's frame here).
+        design: active Fusion design
+        target_face: a cylindrical BRepFace — any orientation.
     """
-    # --- Read face geometry and populate iparams ---
-    frame = _read_face_frame(target_face)
+    frame = frame_from_cylinder_face(target_face)
     if frame is None:
         raise ValueError(
-            "Selected face must be a cylindrical face whose axis is parallel to world +Z. "
-            "SnapLock Interface requires a vertically-aligned container cavity wall."
+            "SnapLock Interface requires a cylindrical face. "
+            "Selected face is not a cylinder."
         )
 
-    # Populate cavity_inner_radius and slot_ceiling_z from the face if not set
+    # Populate iparams from frame if the dialog/MCP call didn't already
     if iparams.cavity_inner_radius <= 0:
-        iparams.cavity_inner_radius = frame["radius_cm"]
+        iparams.cavity_inner_radius = frame.radius_cm
+    # slot_ceiling_z in iparams is in frame-local Z (distance along axis
+    # from frame origin), not world Z. Default to the face's top edge.
     if iparams.slot_ceiling_z == 0.0:
-        iparams.slot_ceiling_z = frame["top_z_cm"]
+        iparams.slot_ceiling_z = frame.face_top_cm
 
     iparams.validate_or_raise()
 
@@ -97,68 +91,65 @@ def build_snaplock_interface(
     target_component = target_body.parentComponent
     initial_volume = target_body.volume
 
-    # Build an equivalent SnaplockParams for reusing the existing lid builder
-    # and for sharing derived geometry helpers (tab radii, column position).
+    # Equivalent SnaplockParams for lid generation + shared derived geometry
     sp = iparams.to_equivalent_snaplock_params()
-
     warnings: list = []
 
-    # === Step 1: Cut slots + entries into the user's body ===
-    _cut_slots_and_entries_on_body(
-        sp, target_component, target_body,
-        slot_ceiling_z_cm=iparams.slot_ceiling_z,
+    # --- 1: Construct a reusable frame-local revolve axis once ---
+    frame_axis = create_frame_axis(target_component, frame)
+
+    # --- 2: Cut slots + entries (frame-aware) ---
+    _cut_slots_and_entries_in_frame(
+        sp, target_component, target_body, frame,
+        slot_ceiling_z=iparams.slot_ceiling_z,
+        revolve_axis=frame_axis,
     )
 
-    # === Step 2: Verify wall consistency ===
-    slot_angles = _slot_midpoint_angles(sp)
-    # Probe mid-height of the rim drop region (above any slot/entry cuts)
-    probe_z_cm = iparams.slot_ceiling_z - (iparams.rim_height / 2)
-    scan_min_mm = (iparams.cavity_inner_radius * 10) - 1.0
-    # Extend scan generously outward — we don't know the container's actual
-    # outer wall, so probe up to cavity + a generous wall allowance.
-    scan_max_mm = (iparams.cavity_inner_radius * 10) + 20.0
-    scan_step = 0.25
+    # --- 3: Verify wall consistency at slot midpoints ---
+    slot_angles_deg = _slot_midpoint_angles(sp)
+    probe_z_along = iparams.slot_ceiling_z - (iparams.rim_height / 2)
+    scan_min_cm = iparams.cavity_inner_radius - 0.1
+    scan_max_cm = iparams.cavity_inner_radius + 2.0
+    scan_step_cm = 0.025  # 0.25 mm
     scan_range = [
-        round(scan_min_mm + i * scan_step, 2)
-        for i in range(int((scan_max_mm - scan_min_mm) / scan_step) + 1)
+        round(scan_min_cm + i * scan_step_cm, 4)
+        for i in range(int((scan_max_cm - scan_min_cm) / scan_step_cm) + 1)
     ]
-    wall_check = verify_wall_consistency(
-        target_body, slot_angles, probe_z_cm, r_scan_mm=scan_range
+    wall_check = _verify_wall_consistency_in_frame(
+        target_body, frame, slot_angles_deg, probe_z_along, scan_range,
     )
     if not wall_check["consistent"]:
         raise RuntimeError(
-            f"Slot cuts produced inconsistent wall depth across slot midpoints: "
-            f"{wall_check['angles']}. Expected a single R value (the container's "
-            f"cavity inner face), got {wall_check['r_values']}. This usually means "
-            "the selected face isn't fully concentric, or the container has "
-            "internal features that interfere with the slot cut region."
+            f"Slot cuts produced inconsistent wall depth: {wall_check['angles']}. "
+            f"Expected a single R value, got {wall_check['r_values']}. "
+            "Container cavity may not be fully concentric with the selected face."
         )
+    detected_wall_inner_r_cm = wall_check["r_values"][0]
 
-    detected_wall_inner_r_mm = wall_check["r_values"][0]
-
-    # === Step 3: Snap columns ===
-    _build_snap_columns_on_body(
-        sp, target_component, target_body,
-        slot_ceiling_z_cm=iparams.slot_ceiling_z,
-        detected_wall_inner_r_mm=detected_wall_inner_r_mm,
+    # --- 4: Snap columns (frame-aware) ---
+    _build_snap_columns_in_frame(
+        sp, target_component, target_body, frame,
+        slot_ceiling_z=iparams.slot_ceiling_z,
+        detected_wall_inner_r_cm=detected_wall_inner_r_cm,
+        revolve_axis=frame_axis,
     )
 
-    # === Step 4: Verify column presence ===
-    column_check = _verify_columns_exist(
-        sp, target_body,
-        slot_ceiling_z_cm=iparams.slot_ceiling_z,
+    # --- 5: Verify columns present ---
+    column_check = _verify_columns_in_frame(
+        sp, target_body, frame,
+        slot_ceiling_z=iparams.slot_ceiling_z,
     )
     if not column_check["all_present"]:
         warnings.append(
             f"Column verification: only {column_check['present_count']}/{sp.num_tabs} "
-            f"columns detected by pointContainment. Details: {column_check['details']}"
+            f"columns detected. Details: {column_check['details']}"
         )
 
-    # === Step 5: Fillet column tips (non-fatal) ===
+    # --- 6: Fillet column tips (non-fatal) ---
     try:
-        filleted = _fillet_column_tips(
-            sp, target_component, target_body,
-            slot_ceiling_z_cm=iparams.slot_ceiling_z,
+        filleted = _fillet_column_tips_in_frame(
+            sp, target_component, target_body, frame,
+            slot_ceiling_z=iparams.slot_ceiling_z,
         )
         if filleted < sp.num_tabs:
             warnings.append(
@@ -173,34 +164,21 @@ def build_snaplock_interface(
         "component": target_component,
         "volume_mm3": target_body.volume * 1000,
         "initial_volume_mm3": initial_volume * 1000,
-        "detected_wall_inner_r_mm": detected_wall_inner_r_mm,
+        "detected_wall_inner_r_mm": detected_wall_inner_r_cm * 10,
+        "frame_axis": {
+            "world_aligned": frame.is_world_z_aligned,
+            "direction": list(frame.axis),
+        },
         "column_check": column_check,
         "warnings": warnings,
     }
 
-    # === Step 6: Generate matching Lid (optional) ===
+    # --- 7: Generate matching Lid (optional) ---
     lid_result = None
     if iparams.create_matching_lid:
-        root_comp = design.rootComponent
-        lid_occ = create_component_at(
-            root_comp,
-            iparams.lid_name,
-            z_offset_cm=sp.lid_build_z_offset,
+        lid_result = _build_matching_lid(
+            sp, iparams, design, frame, warnings,
         )
-        try:
-            lid_result = build_lid(sp, lid_occ)
-            warnings.extend(lid_result.get("warnings", []))
-            # Move Lid to assembly position (Z = slot_ceiling_z, i.e. sitting
-            # at the top of the user's container)
-            move_occurrence_z(lid_occ, iparams.slot_ceiling_z)
-        except Exception as e:
-            # Lid failure is non-fatal — the interface is already applied
-            warnings.append(f"Lid generation failed: {e}")
-            try:
-                lid_occ.deleteMe()
-            except Exception:
-                pass
-            lid_result = None
 
     return {
         "receiver": receiver_result,
@@ -211,103 +189,162 @@ def build_snaplock_interface(
 
 
 # ============================================================
-# Face geometry reading
+# Lid generation + orientation
 # ============================================================
 
-def _read_face_frame(face: "adsk.fusion.BRepFace") -> Optional[dict]:
+def _build_matching_lid(
+    sp: SnaplockParams,
+    iparams: SnaplockInterfaceParams,
+    design: "adsk.fusion.Design",
+    frame: CylinderFrame,
+    warnings: list,
+) -> Optional[dict]:
     """
-    Read a cylindrical face's geometry into a frame dict. Returns None
-    if the face isn't a vertically-aligned cylinder.
+    Generate the Lid as a standalone component, then orient and position
+    it to mate with the user's container.
 
-    Frame fields (all cm):
-        radius_cm: cylinder radius
-        top_z_cm:  world Z of the face's top edge
-        bot_z_cm:  world Z of the face's bottom edge
-        height_cm: top_z - bot_z
+    The lid_builder produces a Lid whose cap sits at world Z=0 looking
+    +Z (that's the convention — see lid_builder.py). For a world-Z-aligned
+    container, we just translate the Lid up to the slot ceiling (+ the
+    build offset during construction). For a tilted container, we need
+    to rotate the Lid to match the frame's axis and then translate.
     """
-    geom = face.geometry
-    if not isinstance(geom, adsk.core.Cylinder):
+    root_comp = design.rootComponent
+    # Build at +offset along the lid's own Z so the fresh geometry
+    # is far from any target body during construction.
+    lid_occ = create_component_at(
+        root_comp,
+        iparams.lid_name,
+        z_offset_cm=sp.lid_build_z_offset,
+    )
+    try:
+        lid_result = build_lid(sp, lid_occ)
+    except Exception as e:
+        warnings.append(f"Lid generation failed: {e}")
+        try:
+            lid_occ.deleteMe()
+        except Exception:
+            pass
         return None
 
-    # Axis must be ±Z for v1 (XZ-plane sketching assumption)
-    axis = adsk.core.Vector3D.create(geom.axis.x, geom.axis.y, geom.axis.z)
-    axis.normalize()
-    if abs(axis.z) < 0.99:
-        return None
+    warnings.extend(lid_result.get("warnings", []))
 
-    # Scan the face's vertices to find Z extent
-    min_z = float('inf')
-    max_z = float('-inf')
-    for ei in range(face.edges.count):
-        edge = face.edges.item(ei)
-        for vertex in (edge.startVertex, edge.endVertex):
-            if vertex is None:
-                continue
-            z = vertex.geometry.z
-            if z < min_z:
-                min_z = z
-            if z > max_z:
-                max_z = z
+    # Compute the assembly transform: rotate Lid's +Z to match frame axis,
+    # then translate so the lid's cap sits at the frame's slot_ceiling_z.
+    transform = _lid_assembly_transform(frame, iparams.slot_ceiling_z)
+    lid_occ.transform = transform
 
-    if min_z == float('inf'):
-        # Fall back to bounding box
-        bb = face.boundingBox
-        min_z = bb.minPoint.z
-        max_z = bb.maxPoint.z
+    lid_result["oriented"] = not frame.is_world_z_aligned
+    return lid_result
 
-    return {
-        "radius_cm": geom.radius,
-        "top_z_cm": max_z,
-        "bot_z_cm": min_z,
-        "height_cm": max_z - min_z,
-    }
+
+def _lid_assembly_transform(
+    frame: CylinderFrame,
+    slot_ceiling_z_along: float,
+) -> "adsk.core.Matrix3D":
+    """
+    Build a Fusion Matrix3D that orients + positions a Lid occurrence so
+    its locally-up axis aligns with the frame's axis and its cap sits at
+    the frame's slot ceiling point.
+
+    For a world-Z-aligned frame, this reduces to a pure translation along
+    +Z (which is what the original receiver_builder's move_occurrence_z
+    achieves). For a tilted frame, we construct a rotation that maps
+    world +Z → frame.axis and compose it with the translation.
+    """
+    # Target point = frame.origin + slot_ceiling_z_along * frame.axis
+    target_point = cylindrical_to_world(
+        frame.origin, frame.axis, frame.perp,
+        r=0.0, z_along=slot_ceiling_z_along, theta_rad=0.0,
+    )
+
+    m = adsk.core.Matrix3D.create()
+
+    if frame.is_world_z_aligned:
+        # Pure translation — the lid's native +Z already matches the frame
+        m.translation = adsk.core.Vector3D.create(*target_point)
+        return m
+
+    # Build a rotation matrix that sends world +Z to frame.axis.
+    # Use axis-angle: rotation axis = (world_z × frame.axis), normalized;
+    # angle = acos(world_z · frame.axis).
+    fz = (0.0, 0.0, 1.0)
+    fa = frame.axis
+    dot = fz[0] * fa[0] + fz[1] * fa[1] + fz[2] * fa[2]
+    # Guard: if frame axis is (anti)parallel to world Z, no rotation (or 180°)
+    if dot > 0.9999:
+        m.translation = adsk.core.Vector3D.create(*target_point)
+        return m
+    if dot < -0.9999:
+        # 180° flip around any perpendicular — use frame.perp
+        rot_axis = adsk.core.Vector3D.create(*frame.perp)
+        m.setToRotation(
+            math.pi,
+            rot_axis,
+            adsk.core.Point3D.create(0, 0, 0),
+        )
+        m.translation = adsk.core.Vector3D.create(*target_point)
+        return m
+
+    # General case: cross product gives the rotation axis
+    rx = fz[1] * fa[2] - fz[2] * fa[1]
+    ry = fz[2] * fa[0] - fz[0] * fa[2]
+    rz = fz[0] * fa[1] - fz[1] * fa[0]
+    rot_axis_vec = adsk.core.Vector3D.create(rx, ry, rz)
+    rot_axis_vec.normalize()
+    angle = math.acos(max(-1.0, min(1.0, dot)))
+
+    m.setToRotation(
+        angle,
+        rot_axis_vec,
+        adsk.core.Point3D.create(0, 0, 0),
+    )
+    m.translation = adsk.core.Vector3D.create(*target_point)
+    return m
 
 
 # ============================================================
-# Slot + entry cuts (on existing body, at arbitrary Z reference)
+# Frame-aware slot + entry cut
 # ============================================================
 
 def _slot_midpoint_angles(params: SnaplockParams) -> list:
-    """Angular midpoints of each slot in degrees. Copy of receiver_builder's helper."""
     half_tab = params.tab_revolve_angle / 2
     sector = 360.0 / params.num_tabs
     return [half_tab + i * sector for i in range(params.num_tabs)]
 
 
-def _snapshot_bodies(component: "adsk.fusion.Component") -> set:
-    """Snapshot the set of body indices currently in the component."""
-    return {component.bRepBodies.item(i) for i in range(component.bRepBodies.count)}
+def _snapshot_bodies(component: "adsk.fusion.Component") -> int:
+    """
+    Snapshot the body count so we can identify new bodies after an op.
+
+    BRepBody is not hashable, so we use the COUNT as a snapshot marker.
+    This assumes Fusion appends new bodies to the end of the collection
+    (which is its documented behavior).
+    """
+    return component.bRepBodies.count
 
 
-def _bodies_added_since(
-    component: "adsk.fusion.Component",
-    before: set,
-) -> list:
-    """Return bodies present in `component` that weren't in `before`."""
+def _bodies_added_since(component, before: int) -> list:
+    """Return all bodies added after the snapshot count."""
     return [
         component.bRepBodies.item(i)
-        for i in range(component.bRepBodies.count)
-        if component.bRepBodies.item(i) not in before
+        for i in range(before, component.bRepBodies.count)
     ]
 
 
-def _cut_slots_and_entries_on_body(
+def _cut_slots_and_entries_in_frame(
     params: SnaplockParams,
     component: "adsk.fusion.Component",
     target_body: "adsk.fusion.BRepBody",
-    slot_ceiling_z_cm: float,
+    frame: CylinderFrame,
+    slot_ceiling_z: float,
+    revolve_axis,
 ):
     """
-    Build slot + entry tool bodies, pattern them, and Cut from target_body.
-
-    The target body belongs to `component`. Tool bodies are built on
-    `component`'s XZ plane (requires the target to be axis-aligned with
-    world Z — enforced by _read_face_frame).
-
-    Z math is shifted so that `slot_ceiling_z_cm` plays the role the
-    receiver_builder calls "Z_wall_top" (= 0 in its hardcoded version).
+    Build slot + entry tool bodies in the frame's radial plane, pattern
+    around the frame axis, and Combine-Cut from the target body.
     """
-    Z_wall_top = slot_ceiling_z_cm
+    Z_wall_top = slot_ceiling_z
     Z_tab_top = Z_wall_top - params.rim_height
     Z_tab_drop = Z_tab_top - params.tab_drop_height
     Z_tab_bottom = Z_tab_top - params.tab_drop_height - params.tab_chamfer_drop
@@ -317,52 +354,53 @@ def _cut_slots_and_entries_on_body(
 
     before = _snapshot_bodies(component)
 
-    # --- Slot profile (tab shape) ---
+    # Build the reusable radial sketch plane once (both slot and entry
+    # profiles sit on the same plane — they're on different angular
+    # offsets from the revolve axis, not different planes).
+    radial_plane = create_radial_plane(component, frame)
+
+    # --- Slot profile (tab shape, revolved by +tab_revolve_angle) ---
+    slot_sketch = component.sketches.add(radial_plane)
     slot_points = [
         (R_inner, Z_tab_top),
         (R_outer, Z_tab_top),
         (R_outer, Z_tab_drop),
         (R_inner, Z_tab_bottom),
     ]
-    slot_sketch = component.sketches.add(component.xZConstructionPlane)
-    sketch_xz_closed_profile(slot_sketch, slot_points)
+    sketch_radial_profile_in_frame(slot_sketch, frame, slot_points)
     slot_profile = slot_sketch.profiles.item(0)
-    slot_rev = revolve_profile(
-        component, slot_profile,
+    slot_rev = _revolve_around_axis(
+        component, slot_profile, revolve_axis,
         f"{params.tab_revolve_angle} deg",
         adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
     )
     slot_body = slot_rev.bodies.item(0)
 
-    # --- Entry profile (tab shape extended up to wall top) ---
+    # --- Entry profile (tab + rectangle to wall top, revolved the other way) ---
+    entry_sketch = component.sketches.add(radial_plane)
     entry_points = [
         (R_inner, Z_tab_bottom),
         (R_outer, Z_tab_drop),
         (R_outer, Z_wall_top),
         (R_inner, Z_wall_top),
     ]
-    entry_sketch = component.sketches.add(component.xZConstructionPlane)
-    sketch_xz_closed_profile(entry_sketch, entry_points)
+    sketch_radial_profile_in_frame(entry_sketch, frame, entry_points)
     entry_profile = entry_sketch.profiles.item(0)
-    entry_rev = revolve_profile(
-        component, entry_profile,
+    entry_rev = _revolve_around_axis(
+        component, entry_profile, revolve_axis,
         f"-{params.slot_entry_angle} deg",
         adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
     )
     entry_body = entry_rev.bodies.item(0)
 
-    # --- Pattern both tool bodies around Z ---
-    pattern_bodies_around_z(
-        component,
-        [slot_body, entry_body],
+    # Pattern both tool bodies around the frame axis
+    _pattern_bodies_around_axis(
+        component, [slot_body, entry_body], revolve_axis,
         count=params.num_tabs,
         total_angle_expr="360 deg",
     )
 
-    # All new bodies are tools
     tool_bodies = _bodies_added_since(component, before)
-
-    # Combine-cut from the user's existing target body
     combine_bodies(
         component,
         target=target_body,
@@ -372,28 +410,64 @@ def _cut_slots_and_entries_on_body(
     )
 
 
+def _revolve_around_axis(
+    component: "adsk.fusion.Component",
+    profile: "adsk.fusion.Profile",
+    axis,
+    angle_expr: str,
+    operation: int,
+):
+    """Revolve a profile around an explicit construction axis."""
+    revolves = component.features.revolveFeatures
+    rev_input = revolves.createInput(profile, axis, operation)
+    rev_input.setAngleExtent(False, adsk.core.ValueInput.createByString(angle_expr))
+    return revolves.add(rev_input)
+
+
+def _pattern_bodies_around_axis(
+    component: "adsk.fusion.Component",
+    bodies: list,
+    axis,
+    count: int,
+    total_angle_expr: str,
+):
+    """Circular-pattern bodies around an explicit construction axis."""
+    patterns = component.features.circularPatternFeatures
+    body_coll = adsk.core.ObjectCollection.create()
+    for b in bodies:
+        body_coll.add(b)
+    pat_input = patterns.createInput(body_coll, axis)
+    pat_input.quantity = adsk.core.ValueInput.createByReal(count)
+    pat_input.totalAngle = adsk.core.ValueInput.createByString(total_angle_expr)
+    pat_input.isSymmetric = False
+    return patterns.add(pat_input)
+
+
 # ============================================================
-# Snap columns (on existing body, at arbitrary Z reference)
+# Frame-aware snap columns
 # ============================================================
 
-def _build_snap_columns_on_body(
+def _build_snap_columns_in_frame(
     params: SnaplockParams,
     component: "adsk.fusion.Component",
     target_body: "adsk.fusion.BRepBody",
-    slot_ceiling_z_cm: float,
-    detected_wall_inner_r_mm: float,
+    frame: CylinderFrame,
+    slot_ceiling_z: float,
+    detected_wall_inner_r_cm: float,
+    revolve_axis,
 ):
     """
-    Build snap columns and Join them into the user's target body.
-    Z-reference-aware version of receiver_builder._build_snap_columns.
+    Build snap columns on a frame-perpendicular cross-section plane and
+    Join them into the target body.
+
+    The sketch plane is perpendicular to the frame axis at Z=slot_ceiling_z.
+    Each column is a circle on that plane, extruded along the axis
+    direction down through the wall.
     """
-    wall_inner_cm = detected_wall_inner_r_mm / 10.0
+    wall_inner_cm = detected_wall_inner_r_cm
     col_r_cm = params.column_radial_pos
     col_radius = params.column_radius
 
-    # Safety: column's inner edge must straddle the wall inner face so
-    # the protrusion is visible on the slot side but the column body
-    # still overlaps solid material for the Join to work.
     inner_edge = col_r_cm - col_radius
     outer_edge = col_r_cm + col_radius
     if not (inner_edge < wall_inner_cm < outer_edge):
@@ -401,26 +475,42 @@ def _build_snap_columns_on_body(
 
     before = _snapshot_bodies(component)
 
-    # Sketch plane at the slot ceiling Z (the wall top of the interface feature)
-    planes = component.constructionPlanes
-    plane_in = planes.createInput()
-    plane_in.setByOffset(
-        component.xYConstructionPlane,
-        adsk.core.ValueInput.createByReal(slot_ceiling_z_cm),
+    # Cross-section plane at the slot ceiling
+    cross_plane = create_cross_section_plane(
+        component, frame, z_along_cm=slot_ceiling_z,
     )
-    col_plane = planes.add(plane_in)
 
-    sketch = component.sketches.add(col_plane)
+    sketch = component.sketches.add(cross_plane)
+
+    # Project the column circle's CENTER into sketch-local coordinates.
+    # On a cross-section plane, the sketch's origin is at the cylinder axis
+    # (where the plane intersects it), and sketch-X / sketch-Y span the
+    # radial directions. We compute the column's world position first, then
+    # project into sketch local.
     first_angle_deg = params.tab_revolve_angle / 2
-    rad = math.radians(first_angle_deg)
-    cx = col_r_cm * math.cos(rad)
-    cy = col_r_cm * math.sin(rad)
+    first_angle_rad = math.radians(first_angle_deg)
+
+    col_world = frame.point_at(
+        r=col_r_cm,
+        z_along=slot_ceiling_z,
+        theta_rad=first_angle_rad,
+    )
+
+    so = sketch.origin
+    sx_dir = sketch.xDirection
+    sy_dir = sketch.yDirection
+    dx = col_world[0] - so.x
+    dy = col_world[1] - so.y
+    dz = col_world[2] - so.z
+    sxy_x = dx * sx_dir.x + dy * sx_dir.y + dz * sx_dir.z
+    sxy_y = dx * sy_dir.x + dy * sy_dir.y + dz * sy_dir.z
+
     sketch.sketchCurves.sketchCircles.addByCenterRadius(
-        adsk.core.Point3D.create(cx, cy, 0),
+        adsk.core.Point3D.create(sxy_x, sxy_y, 0),
         col_radius,
     )
 
-    # Extrude downward from the slot ceiling into the wall + protrusion
+    # Extrude along the negative axis direction (into the wall).
     extrude_distance = params.body_height + params.column_protrusion
     prof = sketch.profiles.item(0)
     extrudes = component.features.extrudeFeatures
@@ -435,18 +525,14 @@ def _build_snap_columns_on_body(
     )
     extrudes.add(ext_input)
 
-    # Pattern around Z
     col_bodies_created = _bodies_added_since(component, before)
-    pattern_bodies_around_z(
-        component,
-        col_bodies_created,
+    _pattern_bodies_around_axis(
+        component, col_bodies_created, revolve_axis,
         count=params.num_tabs,
         total_angle_expr="360 deg",
     )
 
-    # Every new body since snapshot is a column body to join
     all_column_bodies = _bodies_added_since(component, before)
-
     combine_bodies(
         component,
         target=target_body,
@@ -457,27 +543,60 @@ def _build_snap_columns_on_body(
 
 
 # ============================================================
-# Verification (copies of receiver_builder logic, Z-reference aware)
+# Frame-aware verification
 # ============================================================
 
-def _verify_columns_exist(
+def _verify_wall_consistency_in_frame(
+    body: "adsk.fusion.BRepBody",
+    frame: CylinderFrame,
+    angles_deg: list,
+    z_along_cm: float,
+    r_scan_cm: list,
+) -> dict:
+    """
+    Probe pointContainment at frame-local cylindrical coordinates to find
+    the R where each angular slice's wall starts.
+    """
+    angles = {}
+    for ang_deg in angles_deg:
+        found_r = None
+        theta_rad = math.radians(ang_deg)
+        for r in r_scan_cm:
+            world = frame.point_at(r=r, z_along=z_along_cm, theta_rad=theta_rad)
+            pt = adsk.core.Point3D.create(*world)
+            if body.pointContainment(pt) == 0:  # PointInside
+                found_r = round(r * 10, 3)  # return in mm for reporting
+                break
+        angles[ang_deg] = found_r
+
+    r_values = sorted({v for v in angles.values() if v is not None})
+    return {
+        "consistent": len(r_values) == 1,
+        "angles": angles,
+        "r_values": [v / 10.0 for v in r_values],  # back to cm for the caller
+    }
+
+
+def _verify_columns_in_frame(
     params: SnaplockParams,
     target_body: "adsk.fusion.BRepBody",
-    slot_ceiling_z_cm: float,
+    frame: CylinderFrame,
+    slot_ceiling_z: float,
 ) -> dict:
-    """Probe each slot midpoint to verify a column is present."""
-    angles = _slot_midpoint_angles(params)
-
-    # Probe point: below slot ceiling by (rim_height + column_protrusion/2) cm
-    z_probe_cm = slot_ceiling_z_cm - (params.rim_height + params.column_protrusion / 2)
-    z_probe_mm = z_probe_cm * 10
-    r_probe_mm = params.column_radial_pos * 10
+    """Probe each slot midpoint (in frame coords) to verify a column is present."""
+    angles_deg = _slot_midpoint_angles(params)
+    z_probe_along = slot_ceiling_z - (params.rim_height + params.column_protrusion / 2)
+    r_probe_cm = params.column_radial_pos
 
     details = {}
     present_count = 0
-    for ang in angles:
-        status = verify_point_in_body(target_body, r_probe_mm, ang, z_probe_mm)
-        details[ang] = status
+    status_map = {0: "IN", 1: "FACE", 2: "OUT"}
+    for ang_deg in angles_deg:
+        theta_rad = math.radians(ang_deg)
+        world = frame.point_at(r=r_probe_cm, z_along=z_probe_along, theta_rad=theta_rad)
+        pt = adsk.core.Point3D.create(*world)
+        status = status_map.get(target_body.pointContainment(pt), "?")
+        details[ang_deg] = status
         if status in ("IN", "FACE"):
             present_count += 1
 
@@ -486,32 +605,45 @@ def _verify_columns_exist(
         "present_count": present_count,
         "total": params.num_tabs,
         "details": details,
-        "probe_point": {"r_mm": r_probe_mm, "z_mm": z_probe_mm},
+        "probe_point": {"r_cm": r_probe_cm, "z_along_cm": z_probe_along},
     }
 
 
-def _fillet_column_tips(
+def _fillet_column_tips_in_frame(
     params: SnaplockParams,
     component: "adsk.fusion.Component",
     target_body: "adsk.fusion.BRepBody",
-    slot_ceiling_z_cm: float,
+    frame: CylinderFrame,
+    slot_ceiling_z: float,
 ) -> int:
-    """Find circular edges at the column tip Z position and fillet them."""
-    tip_z_cm = slot_ceiling_z_cm - (params.rim_height + params.column_protrusion)
-    tip_circumference_mm = math.pi * params.column_diameter * 10
-    tolerance_mm = 0.5
+    """
+    Find circular edges at the column tip Z and fillet them.
+
+    Tip Z in frame-local coords = slot_ceiling_z - rim_height - column_protrusion.
+    We can't easily compare edge Z directly in world coords for a tilted frame,
+    so we project each edge's midpoint into frame-local coords and check the
+    Z_along component.
+    """
+    tip_z_along = slot_ceiling_z - (params.rim_height + params.column_protrusion)
+    tip_circumference_cm = math.pi * params.column_diameter
+    tolerance_cm = 0.05
 
     edges_coll = adsk.core.ObjectCollection.create()
+    axis = frame.axis
+    origin = frame.origin
     for ei in range(target_body.edges.count):
         edge = target_body.edges.item(ei)
-        length_mm = edge.length * 10
-        if abs(length_mm - tip_circumference_mm) > tolerance_mm:
+        if abs(edge.length - tip_circumference_cm) > tolerance_cm:
             continue
         try:
             evaluator = edge.evaluator
             _, pt = evaluator.getPointAtParameter(0)
-            z_mm = pt.z * 10
-            if abs(z_mm - tip_z_cm * 10) < 0.2:
+            # Project onto frame axis to get z_along in frame coords
+            rel_x = pt.x - origin[0]
+            rel_y = pt.y - origin[1]
+            rel_z = pt.z - origin[2]
+            z_along = rel_x * axis[0] + rel_y * axis[1] + rel_z * axis[2]
+            if abs(z_along - tip_z_along) < 0.02:  # 0.2 mm tolerance
                 edges_coll.add(edge)
         except Exception:
             continue
@@ -532,3 +664,23 @@ def _fillet_column_tips(
         return edges_coll.count
     except Exception:
         return 0
+
+
+# ============================================================
+# Backward compatibility shim
+# ============================================================
+# The v0.10.0 command dialog imports `_read_face_frame` from this module.
+# Keep a compatibility shim that returns the old dict shape from a
+# CylinderFrame. New callers should use frame_from_cylinder_face directly.
+
+def _read_face_frame(face) -> dict:
+    """Deprecated — retained for v0.10.0 dialog compatibility."""
+    cf = frame_from_cylinder_face(face)
+    if cf is None:
+        return None
+    return {
+        "radius_cm": cf.radius_cm,
+        "top_z_cm": cf.face_top_cm,
+        "bot_z_cm": cf.face_bot_cm,
+        "height_cm": cf.face_height_cm,
+    }

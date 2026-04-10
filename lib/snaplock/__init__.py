@@ -16,6 +16,7 @@ Usage:
     # result['warnings'] = [...]
 """
 from .parameters import SnaplockParams, SnaplockInterfaceParams
+from .frame import CylinderFrame, frame_from_cylinder_face, world_z_aligned_frame
 from .lid_builder import build_lid
 from .receiver_builder import build_receiver
 from .interface_builder import build_snaplock_interface
@@ -26,6 +27,9 @@ import adsk.fusion  # type: ignore
 __all__ = [
     "SnaplockParams",
     "SnaplockInterfaceParams",
+    "CylinderFrame",
+    "frame_from_cylinder_face",
+    "world_z_aligned_frame",
     "build_lid",
     "build_receiver",
     "build_snaplock",
