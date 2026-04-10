@@ -24,10 +24,15 @@ CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_cmdSnaplockCreate'
 CMD_NAME = 'SnapLock'
 CMD_Description = 'Create a parametric twist-snap bayonet container (Lid + Receiver)'
 
-# UI placement: Solid workspace → Create panel
+# UI placement: shared "3D Print Tools" panel on the Solid tab.
+# This panel ID is a convention shared across the flight505 3D-printing add-ins
+# (Tongue & Groove, ThreadMaker, Knurling, Hexagon Generator, SnapLock).
+# The FIRST add-in to start creates the panel; subsequent add-ins just add to it.
 WORKSPACE_ID = 'FusionSolidEnvironment'
-PANEL_ID = 'SolidCreatePanel'
-COMMAND_BESIDE_ID = ''  # Empty = append to end of panel
+SOLID_TAB_ID = 'SolidTab'
+SHARED_PANEL_ID = 'flight505_3DPrintTools_panel'
+SHARED_PANEL_NAME = '3D Print Tools'
+PANEL_POSITION_AFTER = 'SolidModifyPanel'  # Place panel after "Modify" on the Solid tab
 
 IS_PROMOTED = True
 
@@ -79,27 +84,56 @@ def _ensure_snaplock_on_path():
 # =========================================================================
 
 def start():
+    # Clean up any stale command definition left over from a previous run
+    old = ui.commandDefinitions.itemById(CMD_ID)
+    if old:
+        old.deleteMe()
+
     cmd_def = ui.commandDefinitions.addButtonDefinition(
         CMD_ID, CMD_NAME, CMD_Description, ICON_FOLDER
     )
     futil.add_handler(cmd_def.commandCreated, command_created)
 
+    # Find or create the shared "3D Print Tools" panel on the Solid tab
     workspace = ui.workspaces.itemById(WORKSPACE_ID)
-    panel = workspace.toolbarPanels.itemById(PANEL_ID)
-    control = panel.controls.addCommand(cmd_def, COMMAND_BESIDE_ID, False)
-    control.isPromoted = IS_PROMOTED
+    solid_tab = workspace.toolbarTabs.itemById(SOLID_TAB_ID)
+    panel = solid_tab.toolbarPanels.itemById(SHARED_PANEL_ID)
+    if not panel:
+        panel = solid_tab.toolbarPanels.add(
+            SHARED_PANEL_ID,
+            SHARED_PANEL_NAME,
+            PANEL_POSITION_AFTER,
+            False,
+        )
+
+    if panel:
+        control = panel.controls.addCommand(cmd_def)
+        control.isPromotedByDefault = IS_PROMOTED
 
 
 def stop():
-    workspace = ui.workspaces.itemById(WORKSPACE_ID)
-    panel = workspace.toolbarPanels.itemById(PANEL_ID)
-    command_control = panel.controls.itemById(CMD_ID)
-    command_definition = ui.commandDefinitions.itemById(CMD_ID)
+    # Scan all panels that might hold our button (shared panel + any legacy
+    # placements) and remove from each.
+    legacy_panel_ids = (
+        SHARED_PANEL_ID,
+        'SolidCreatePanel',  # legacy from earlier version of this add-in
+        'SolidScriptsAddinsPanel',
+    )
+    for pid in legacy_panel_ids:
+        panel = ui.allToolbarPanels.itemById(pid)
+        if not panel:
+            continue
+        ctrl = panel.controls.itemById(CMD_ID)
+        if ctrl:
+            ctrl.deleteMe()
+        # If the shared panel is now empty (no other 3D print tools running),
+        # remove it so Fusion's UI doesn't show an empty panel.
+        if pid == SHARED_PANEL_ID and panel.controls.count == 0:
+            panel.deleteMe()
 
-    if command_control:
-        command_control.deleteMe()
-    if command_definition:
-        command_definition.deleteMe()
+    cmd_def = ui.commandDefinitions.itemById(CMD_ID)
+    if cmd_def:
+        cmd_def.deleteMe()
 
 
 # =========================================================================
