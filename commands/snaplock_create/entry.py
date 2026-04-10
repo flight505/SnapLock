@@ -22,7 +22,7 @@ ui = app.userInterface
 # --- Command identity ---
 CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_cmdSnaplockCreate'
 CMD_NAME = 'SnapLock'
-CMD_Description = 'Create a parametric twist-snap bayonet container (Lid + Receiver)'
+CMD_DESCRIPTION = 'Create a parametric twist-snap bayonet container (Lid + Receiver)'
 
 # UI placement: shared "3D Print Tools" panel on the Solid tab.
 # This panel ID is a convention shared across the flight505 3D-printing add-ins
@@ -91,7 +91,7 @@ def start():
         old.deleteMe()
 
     cmd_def = ui.commandDefinitions.addButtonDefinition(
-        CMD_ID, CMD_NAME, CMD_Description, ICON_FOLDER
+        CMD_ID, CMD_NAME, CMD_DESCRIPTION, ICON_FOLDER
     )
     futil.add_handler(cmd_def.commandCreated, command_created)
 
@@ -344,10 +344,6 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
 
 # =========================================================================
-# Execute the build
-# =========================================================================
-
-# =========================================================================
 # Preview (live rebuild on input change, opt-in via checkbox)
 # =========================================================================
 
@@ -414,17 +410,9 @@ def command_execute(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Execute Event')
     inputs = args.command.commandInputs
 
-    # If preview was on and successfully built the geometry, Fusion has
-    # already set the preview as the final result (via args.isValidResult
-    # in command_preview). In that case, executePreview handled everything
-    # and we should not rebuild.
-    #
-    # We can detect this by checking the preview checkbox: if it's on and
-    # we reach here, either the preview was cleared (user toggled it off
-    # mid-edit) or Fusion is asking us to finalize anyway. In practice, if
-    # preview.isValidResult was set, execute() is not called. So if we're
-    # here, we need to build from scratch.
-
+    # If preview set args.isValidResult = True, Fusion won't call execute()
+    # at all — reaching here means no valid preview exists and we need to
+    # build from scratch.
     try:
         params, snaplock = _params_from_inputs(inputs)
 
