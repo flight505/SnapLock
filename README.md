@@ -1,6 +1,6 @@
 # SnapLock
 
-A twist-snap bayonet lock mechanism for 3D-printed containers, with a Fusion 360 add-in template and a full parametric specification.
+A parametric twist-snap bayonet lock mechanism for 3D-printed containers — implemented as a **Fusion 360 add-in** and usable as a library by the [f360mcp](https://github.com/flight505/f360mcp) MCP server.
 
 ## Overview
 
@@ -13,9 +13,10 @@ Two concentric cylindrical parts — a **Lid** and a **Receiver** — that lock 
 | File / Folder | Purpose |
 |---|---|
 | `tutorial.md` | Complete parametric specification — dimensions, cross-sections, build sequence, and hard-won build lessons |
-| `SnapLock .py`, `.manifest` | Fusion 360 add-in entry point (template) |
-| `commands/`, `lib/` | Add-in command/palette scaffolding |
-| `config.py`, `Resources/` | Add-in configuration and icons |
+| `lib/snaplock/` | **Core build library** — parameters, lid_builder, receiver_builder, geometry_utils. Pure Python with Fusion API calls. Reusable by any add-in or the f360mcp server. |
+| `commands/snaplock_create/` | Fusion 360 command dialog (UI for humans) — grouped parameter inputs with live validation, calls `snaplock.build_snaplock()` |
+| `SnapLock .py`, `.manifest` | Fusion 360 add-in entry point |
+| `config.py`, `Resources/`, `AddInIcon.svg` | Add-in configuration and icons |
 
 ## The mechanism
 
@@ -45,13 +46,56 @@ The tutorial includes a **Build Lessons** appendix covering the non-obvious gotc
 - **Lid**: print upside-down (tabs face up). The 45° tab chamfer is self-supporting.
 - **Receiver**: print right-side-up (floor on build plate). Slot walls and columns print cleanly.
 
+## Install (Fusion 360 add-in)
+
+### macOS
+
+```bash
+# Symlink this repo into Fusion's AddIns folder
+mkdir -p ~/Library/Application\ Support/Autodesk/Autodesk\ Fusion\ 360/API/AddIns
+ln -s "/path/to/SnapLock " ~/Library/Application\ Support/Autodesk/Autodesk\ Fusion\ 360/API/AddIns/SnapLock
+```
+
+### Windows
+
+```powershell
+# PowerShell — create a junction from Fusion's AddIns folder
+New-Item -ItemType Junction -Path "$env:APPDATA\Autodesk\Autodesk Fusion 360\API\AddIns\SnapLock" -Target "C:\path\to\SnapLock "
+```
+
+Then in Fusion 360:
+1. Open **Utilities → Add-Ins → Scripts and Add-Ins** (Shift+S)
+2. Switch to the **Add-Ins** tab
+3. Select **SnapLock** and click **Run** (check "Run on Startup" to auto-load)
+
+## Use (standalone, for humans)
+
+1. Open a new or existing Fusion 360 design
+2. Switch to the **Solid** workspace
+3. In the **Create** panel, click **SnapLock**
+4. Adjust the grouped parameters (Size, Walls, Locking mechanism, What to create)
+5. Invalid combinations are caught live in the dialog
+6. Click **OK** — the Lid and Receiver are generated as separate components (typically in under 3 seconds)
+
+## Use (via Claude + MCP)
+
+With the [f360mcp](https://github.com/flight505/f360mcp) MCP server, Claude can call the generator directly:
+
+```
+create_snaplock(outer_diameter=80.0, num_tabs=6)
+```
+
+The f360mcp add-in has a registered `create_snaplock` handler that delegates to the same `snaplock` library this add-in uses. One source of truth for the build logic; two front-ends (dialog UI or MCP).
+
 ## Status
 
 - [x] Parametric spec in `tutorial.md`
-- [x] Fusion 360 model built via MCP (SnapLock_v2)
-- [x] Column/notch alignment verified at all 4 positions
-- [ ] STL export and print test
-- [ ] Fusion 360 add-in: convert procedural build to interactive UI
+- [x] Core build library `lib/snaplock/` (parameters, lid_builder, receiver_builder, geometry_utils)
+- [x] Auto-derived notch/column positions that scale with container size
+- [x] Tested across 40mm–100mm containers, 3–6 tabs, lid-only/receiver-only variants
+- [x] Standalone add-in UI with grouped inputs and live validation
+- [x] f360mcp generator handler + MCP server tool `create_snaplock`
+- [ ] STL export and printed-part test
 - [ ] Tolerance tuning based on print results
 
 ## License
