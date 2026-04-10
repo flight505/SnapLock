@@ -142,7 +142,6 @@ def stop():
 # =========================================================================
 
 def command_created(args: adsk.core.CommandCreatedEventArgs):
-    futil.log(f'{CMD_NAME} Command Created Event')
     inputs = args.command.commandInputs
 
     default_length = app.activeProduct.unitsManager.defaultLengthUnits
@@ -378,13 +377,10 @@ def command_preview(args: adsk.core.CommandEventArgs):
     # Gracefully bail if params don't parse (e.g., user mid-typing)
     try:
         params, snaplock = _params_from_inputs(inputs)
-    except Exception as e:
-        futil.log(f'{CMD_NAME} preview: params parse failed: {e}')
+    except Exception:
         return
 
-    errors = params.validate()
-    if errors:
-        futil.log(f'{CMD_NAME} preview: {len(errors)} validation errors, skipping build')
+    if params.validate():
         return
 
     design = adsk.fusion.Design.cast(app.activeProduct)
@@ -396,10 +392,10 @@ def command_preview(args: adsk.core.CommandEventArgs):
         # Tell Fusion this preview IS the final result — no need to re-run
         # execute() when the user clicks OK.
         args.isValidResult = True
-    except Exception as e:
-        # Preview failures during typing are expected; log but don't crash
-        # the dialog. The user will see the validateInputs feedback.
-        futil.log(f'{CMD_NAME} preview build failed (non-fatal): {e}')
+    except Exception:
+        # Preview failures during typing are expected — swallow silently.
+        # The user will see the validateInputs feedback if something is wrong.
+        pass
 
 
 # =========================================================================
@@ -407,7 +403,6 @@ def command_preview(args: adsk.core.CommandEventArgs):
 # =========================================================================
 
 def command_execute(args: adsk.core.CommandEventArgs):
-    futil.log(f'{CMD_NAME} Command Execute Event')
     inputs = args.command.commandInputs
 
     # If preview set args.isValidResult = True, Fusion won't call execute()
@@ -447,31 +442,33 @@ def command_execute(args: adsk.core.CommandEventArgs):
         except Exception:
             pass
 
-        summary_lines = ['SnapLock created successfully.']
+        # Log committed params for reproducibility (single line, non-blocking)
+        parts = [
+            f"⌀{params.outer_diameter_cm*10:g}mm",
+            f"h={params.body_height_cm*10:g}mm",
+            f"rim_h={params.rim_height_cm*10:g}mm",
+            f"wall={params.outer_wall_thickness_cm*10:g}mm",
+            f"tabs={params.num_tabs}",
+            f"tab_angle={params.tab_revolve_angle_deg:g}deg",
+            f"entry={params.slot_entry_angle_deg:g}deg",
+            f"tab_w={params.tab_width_cm*10:g}mm",
+            f"tab_drop={params.tab_drop_height_cm*10:g}mm",
+            f"col_prot={params.column_protrusion_cm*10:g}mm",
+        ]
+        what = []
         if result.get('lid'):
-            summary_lines.append(
-                f"Lid:      {result['lid']['volume_mm3']:.0f} mm³"
-            )
+            what.append(f"lid({result['lid']['volume_mm3']:.0f}mm³)")
         if result.get('receiver'):
-            rec = result['receiver']
-            summary_lines.append(
-                f"Receiver: {rec['volume_mm3']:.0f} mm³"
-            )
-            cc = rec.get('column_check', {})
-            if cc:
-                summary_lines.append(
-                    f"Snap columns: {cc.get('present_count', 0)}/{cc.get('total', 0)} verified"
-                )
-        if result.get('warnings'):
-            summary_lines.append('')
-            summary_lines.append('Warnings:')
-            for w in result['warnings']:
-                summary_lines.append(f'  • {w}')
+            what.append(f"receiver({result['receiver']['volume_mm3']:.0f}mm³)")
+        app.log(f'[SnapLock] {"+".join(what) or "nothing"} ' + ' '.join(parts))
 
-        ui.messageBox('\n'.join(summary_lines), 'SnapLock')
+        # Show warnings only if any — these need user attention
+        if result.get('warnings'):
+            warning_text = '\n'.join(f'• {w}' for w in result['warnings'])
+            ui.messageBox(f'SnapLock created with warnings:\n\n{warning_text}', 'SnapLock')
 
     except Exception:
-        futil.handle_error('command_execute')
+        ui.messageBox(f'SnapLock execute failed:\n{traceback.format_exc()}', 'SnapLock')
 
 
 def _rollback_to(design: adsk.fusion.Design, marker_position: int):
@@ -483,6 +480,5 @@ def _rollback_to(design: adsk.fusion.Design, marker_position: int):
 
 
 def command_destroy(_args: adsk.core.CommandEventArgs):
-    futil.log(f'{CMD_NAME} Command Destroy Event')
     global local_handlers
     local_handlers = []

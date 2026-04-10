@@ -5,7 +5,7 @@
 	"description":	{
 		"":	"Easy snap locks for inner and outer. "
 	},
-	"version":	"",
+	"version":	"0.9.0",
 	"runOnStartup":	false,
 	"supportedOS":	"windows|mac",
 	"editEnabled":	true,
