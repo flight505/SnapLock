@@ -295,9 +295,25 @@ def _build_snap_columns(
         col_radius,
     )
 
-    # Extrude from Z=0 downward through the wall + protrusion
-    # Distance = body_height + column_protrusion (cm)
-    extrude_distance = params.body_height + params.column_protrusion
+    # Extrude from Z=0 (wall top) DOWN through the rim_height region
+    # of solid wall material, then protrude into the slot cavity by
+    # column_protrusion. The column ends at Z = -(rim_height +
+    # column_protrusion), which is `column_protrusion` mm below the
+    # slot ceiling at Z = -rim_height.
+    #
+    # IMPORTANT: extrude_distance must be `rim_height + column_protrusion`,
+    # NOT `body_height + column_protrusion`. The body_height value over-
+    # extrudes the column past the slot floor and embeds its bottom face
+    # inside solid wall material below the slot, which destroys the
+    # tip's clean circular edge — there is no terminal disc to fillet
+    # because the column never actually terminates inside empty space.
+    #
+    # With the correct distance, the column tip is a flat disc at
+    # Z = -(rim_height + column_protrusion) inside the slot cavity, with
+    # a complete circular perimeter that _fillet_column_tips can find.
+    # This is what produces the rounded "snap-and-release" feel that
+    # the mechanism is designed for.
+    extrude_distance = params.rim_height + params.column_protrusion
     prof = sketch.profiles.item(0)
     extrudes = component.features.extrudeFeatures
     ext_input = extrudes.createInput(prof, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)

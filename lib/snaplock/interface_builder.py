@@ -510,8 +510,23 @@ def _build_snap_columns_in_frame(
         col_radius,
     )
 
-    # Extrude along the negative axis direction (into the wall).
-    extrude_distance = params.body_height + params.column_protrusion
+    # Extrude along the negative axis direction by `rim_height +
+    # column_protrusion`. The column starts at the slot ceiling Z (= the
+    # wall top in frame-local coords), goes DOWN through `rim_height` cm
+    # of solid wall material, and protrudes `column_protrusion` cm into
+    # the slot cavity. The bottom of the column is a flat disc at
+    # Z_along = slot_ceiling - rim_height - column_protrusion, which is
+    # exactly where _fillet_column_tips_in_frame looks for the tip edge.
+    #
+    # IMPORTANT: this MUST be `rim_height + column_protrusion`, NOT
+    # `body_height + column_protrusion`. body_height over-extrudes past
+    # the slot floor and embeds the column bottom in solid wall material
+    # below the slot — the tip never has a clean terminal edge to
+    # fillet, the rounded "snap-and-release" feel is lost, and the
+    # rod-blocks-tab geometry is replaced by a continuous embedded rod.
+    # Verified live in Fusion: with the correct distance, all 4 column
+    # tips fillet successfully into torus surfaces at the expected Z.
+    extrude_distance = params.rim_height + params.column_protrusion
     prof = sketch.profiles.item(0)
     extrudes = component.features.extrudeFeatures
     ext_input = extrudes.createInput(
